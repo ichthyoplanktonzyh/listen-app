@@ -2,6 +2,11 @@
 
 All notable changes to the listen desktop app.
 
+## 2026-07-28 16:40 CST — Independent CI
+
+- Enabled standalone macOS CI for Flutter dependency resolution, strict static
+  analysis, the application test suite, and backend artifact installer tests.
+
 ## 2026-07-28 16:05 CST — Pinned Core Baseline
 
 - Pinned contract `1.0.0` and macOS arm64 runtime `0.7.0` from immutable
