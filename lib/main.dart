@@ -1970,7 +1970,14 @@ class _PlayerScreenState extends State<PlayerScreen>
             (playerController.mediaPath?.isNotEmpty ?? false) &&
             playerController.duration.inMilliseconds > 0,
         createJourney: _createContentPackageJourney,
-        refreshTrigger: coreSessionController,
+        // The predicate reads core connectivity *and* live player readiness
+        // (media id/path/duration). Both can arrive after the workbench first
+        // builds — a core reconnect, or duration landing after open — so the
+        // projection must be invalidated by either source.
+        refreshTrigger: Listenable.merge([
+          coreSessionController,
+          playerController,
+        ]),
       )..bind(text: (key) => l.text(key));
 
   String _contentPackageMediaKind(String? path) {

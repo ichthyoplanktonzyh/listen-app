@@ -93,8 +93,13 @@ class TranscriptReadinessViewModel extends ChangeNotifier {
     required this.mediaSession,
     required this.canAutoPrepare,
     required this.createJourney,
-    this._refreshTrigger,
-  }) {
+    Listenable? refreshTrigger,
+  })
+    // The public seam stays an explicit `refreshTrigger` parameter rather than
+    // a private initializing formal, whose call-site name would depend on the
+    // `private-named-parameters` language feature.
+    // ignore: prefer_initializing_formals
+    : _refreshTrigger = refreshTrigger {
     subtitle.store.addListener(_recompute);
     _refreshTrigger?.addListener(_recompute);
     _recompute();

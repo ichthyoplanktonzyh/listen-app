@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:llplayer_next/controllers/content_package_journey_view_model.dart';
 import 'package:llplayer_next/controllers/learning_controller.dart';
@@ -400,6 +401,56 @@ void main() {
       expect(starts, 0);
       expect(subject.subtitle.primaryTrack, isNull);
     });
+
+    test(
+      'readiness flips unavailable → missing when the readiness input arrives',
+      () {
+        var autoPrepare = false;
+        final trigger = ValueNotifier<int>(0);
+        final subject = _readinessViewModel(
+          tracks: const [],
+          canAutoPrepare: autoPrepare,
+          canAutoPrepareOverride: () => autoPrepare,
+          refreshTrigger: trigger,
+          repository: _FakePackageRepository(),
+        );
+        addTearDown(subject.vm.dispose);
+
+        expect(subject.vm.state.phase, TranscriptReadinessPhase.unavailable);
+
+        // The predicate changed, but the projection must not recompute until
+        // the invalidation seam actually fires — no polling of the predicate.
+        autoPrepare = true;
+        expect(subject.vm.state.phase, TranscriptReadinessPhase.unavailable);
+
+        trigger.value++;
+        expect(subject.vm.state.phase, TranscriptReadinessPhase.missing);
+      },
+    );
+
+    test(
+      'readiness flips missing → unavailable when the readiness input leaves',
+      () {
+        var autoPrepare = true;
+        final trigger = ValueNotifier<int>(0);
+        final subject = _readinessViewModel(
+          tracks: const [],
+          canAutoPrepare: autoPrepare,
+          canAutoPrepareOverride: () => autoPrepare,
+          refreshTrigger: trigger,
+          repository: _FakePackageRepository(),
+        );
+        addTearDown(subject.vm.dispose);
+
+        expect(subject.vm.state.phase, TranscriptReadinessPhase.missing);
+
+        autoPrepare = false;
+        expect(subject.vm.state.phase, TranscriptReadinessPhase.missing);
+
+        trigger.value++;
+        expect(subject.vm.state.phase, TranscriptReadinessPhase.unavailable);
+      },
+    );
   });
 }
 
@@ -453,13 +504,15 @@ Future<void> _settle() async {
   required List<SubtitleTrack> tracks,
   required bool canAutoPrepare,
   required _FakePackageRepository repository,
+  bool Function()? canAutoPrepareOverride,
+  Listenable? refreshTrigger,
 }) {
   final harness = _coordinatorHarness(tracks);
   harness.subtitle.setSubtitleResources(tracks);
   final vm = TranscriptReadinessViewModel(
     subtitle: harness.subtitle,
     mediaSession: harness.mediaSession,
-    canAutoPrepare: () => canAutoPrepare,
+    canAutoPrepare: canAutoPrepareOverride ?? () => canAutoPrepare,
     createJourney: () => ContentPackageJourneyViewModel(
       repository,
       (track) async {
@@ -480,6 +533,7 @@ Future<void> _settle() async {
       mediaKind: 'audio',
       durationMs: 2200,
     ),
+    refreshTrigger: refreshTrigger,
   )..bind(text: (key) => key);
   return (vm: vm, subtitle: harness.subtitle);
 }
