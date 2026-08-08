@@ -339,6 +339,144 @@ void main() {
       },
     );
 
+    testWidgets(
+      'established background download + acquireForLearning joins one handle',
+      (tester) async {
+        final imports = TestMediaImportRepository();
+        final vm = viewModel(imports: imports);
+        await tester.runAsync(() => vm.load());
+        await tester.pump(const Duration(milliseconds: 20));
+
+        final path = await tester.runAsync(() async {
+          // The first download fully returns first: the handle is attached
+          // and the controller is in `downloading` before the intent exists.
+          // A second `startDownload` at this point must join, never relaunch.
+          await vm.startDownload('i-bbc-1');
+          expect(vm.state.downloadStateOf('i-bbc-1'), DownloadState.downloading);
+
+          return vm.acquireForLearning('i-bbc-1');
+        });
+
+        expect(path, '/path/to/downloaded/[i-bbc-1].mp4');
+        expect(
+          imports.downloadedUrls,
+          hasLength(1),
+          reason: 'the intent must join the established download, not start '
+              'a second one',
+        );
+        expect(imports.enclosureRequests, isEmpty);
+        expect(
+          vm.state.mediaAvailabilityOf('i-bbc-1'),
+          DiscoveryMediaAvailability.local,
+        );
+      },
+    );
+
+    testWidgets('cancel before handle attach cannot revive acquisition', (
+      tester,
+    ) async {
+      final gate = Completer<void>();
+      final imports = TestMediaImportRepository(downloadLaunchGate: gate);
+      final library = TestMediaLibraryRepository();
+      final vm = viewModel(imports: imports, library: library);
+      await tester.runAsync(() => vm.load());
+      await tester.pump(const Duration(milliseconds: 20));
+
+      final result = await tester.runAsync(() async {
+        final pending = vm.acquireForLearning('i-bbc-1');
+        // Let the launch reach the downloader call: `starting()` has run but
+        // the handle is still parked on the gate — the exact race window.
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(imports.downloadedUrls, hasLength(1));
+
+        vm.cancelDownload('i-bbc-1');
+        final path = await pending;
+        expect(path, isNull);
+
+        // Release the launch: the stale handle lands and must be dropped
+        // without attach, without adoption, without reviving anything.
+        gate.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        return path;
+      });
+
+      expect(result, isNull);
+      expect(vm.state.downloadStateOf('i-bbc-1'), DownloadState.none);
+      expect(vm.localPathFor('i-bbc-1'), isNull);
+      expect(
+        vm.state.mediaAvailabilityOf('i-bbc-1'),
+        DiscoveryMediaAvailability.remote,
+      );
+      expect(
+        await library.listMediaLibrary(),
+        isEmpty,
+        reason: 'a cancelled launch must never reach Core registration',
+      );
+
+      // The launch bookkeeping survived the stale attempt: a fresh intent
+      // starts and completes a real download on its own terms.
+      imports.downloadLaunchGate = null;
+      final retry = await tester.runAsync(
+        () => vm.acquireForLearning('i-bbc-1'),
+      );
+      expect(retry, '/path/to/downloaded/[i-bbc-1].mp4');
+      expect(imports.downloadedUrls, hasLength(2));
+      expect(
+        vm.state.mediaAvailabilityOf('i-bbc-1'),
+        DiscoveryMediaAvailability.local,
+      );
+    });
+
+    testWidgets('local → removed → refresh clears stale local path', (
+      tester,
+    ) async {
+      final library = TestMediaLibraryRepository(
+        seed: [
+          TestMediaLibraryRepository.entry(
+            id: 'media-i-bbc-1',
+            path: '/library/[i-bbc-1].mp4',
+          ),
+        ],
+      );
+      final vm = viewModel(library: library);
+      await tester.runAsync(() => vm.load());
+      await tester.pump(const Duration(milliseconds: 20));
+
+      expect(
+        vm.state.mediaAvailabilityOf('i-bbc-1'),
+        DiscoveryMediaAvailability.local,
+      );
+      expect(vm.localPathFor('i-bbc-1'), '/library/[i-bbc-1].mp4');
+      expect(vm.state.downloadStateOf('i-bbc-1'), DownloadState.done);
+
+      // The library row disappears (folder emptied, file gone from Core).
+      library.clearEntries();
+      await vm.refreshMediaAvailability('i-bbc-1');
+      await tester.pump();
+
+      expect(
+        vm.state.mediaAvailabilityOf('i-bbc-1'),
+        DiscoveryMediaAvailability.remote,
+      );
+      expect(vm.localPathFor('i-bbc-1'), isNull);
+      expect(
+        vm.state.downloadStateOf('i-bbc-1'),
+        DownloadState.none,
+        reason: 'the completed projection must not keep saying "on device"',
+      );
+
+      // Start Learning must not resurrect the stale path from an old answer.
+      final path = await tester.runAsync(
+        () => vm.acquireForLearning('i-bbc-1'),
+      );
+      expect(path, isNotNull);
+      expect(path, isNot('/library/[i-bbc-1].mp4'));
+      expect(
+        vm.state.mediaAvailabilityOf('i-bbc-1'),
+        DiscoveryMediaAvailability.local,
+      );
+    });
+
     testWidgets('an unacquirable entry resolves with no path and no download', (
       tester,
     ) async {

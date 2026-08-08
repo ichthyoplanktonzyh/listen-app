@@ -78,6 +78,7 @@ class TestMediaImportRepository implements MediaImportRepository {
     this.resolveGate,
     this.downloadFails = false,
     this.holdDownload = false,
+    this.downloadLaunchGate,
   });
 
   /// True makes every download end in an error instead of a path.
@@ -86,6 +87,11 @@ class TestMediaImportRepository implements MediaImportRepository {
   /// True keeps `completed` pending so a test can settle a cancel first and
   /// then release the late callback.
   final bool holdDownload;
+
+  /// When set, the downloader launch parks before returning its handle, so a
+  /// test can hold the window between `controller.starting()` and
+  /// `controller.attach()` open and cancel inside it.
+  Completer<void>? downloadLaunchGate;
 
   final int? probedDurationMs;
   final int resolvedDurationMs;
@@ -126,6 +132,7 @@ class TestMediaImportRepository implements MediaImportRepository {
     if (downloadFails) return TestFailingDownloadHandle();
     final completer = Completer<String?>();
     completers[entryId] = completer;
+    if (downloadLaunchGate != null) await downloadLaunchGate!.future;
     if (holdDownload) return TestHeldDownloadHandle(completer);
     return TestMediaDownloadHandle(entryId, completer);
   }
@@ -145,6 +152,7 @@ class TestMediaImportRepository implements MediaImportRepository {
     final entryId = mediaUrl.contains('i-bbc-1') ? 'i-bbc-1' : 'i-bbc-2';
     final completer = Completer<String?>();
     completers[entryId] = completer;
+    if (downloadLaunchGate != null) await downloadLaunchGate!.future;
     if (holdDownload) return TestHeldDownloadHandle(completer);
     return TestMediaDownloadHandle(entryId, completer);
   }
@@ -245,6 +253,10 @@ class TestMediaLibraryRepository implements MediaLibraryRepository {
   /// Grows the library after construction (e.g. a core reconnect seeding the
   /// entry the first, disconnected check could not see).
   void addEntry(MediaLibraryEntry entry) => _entries.add(entry);
+
+  /// Drops every row (e.g. a folder emptied on disk), so a test can show a
+  /// definitive no-match where an earlier refresh answered local.
+  void clearEntries() => _entries.clear();
 
   @override
   bool get isAvailable => available;

@@ -210,10 +210,20 @@ final class DiscoveryViewModel extends ChangeNotifier {
   /// selection-triggered check share one lookup and callers can await it.
   final Map<String, Future<void>> _availabilityChecks = {};
 
-  /// The window between "download asked" and "handle attached": the controller
-  /// has no downloading state yet, so this set is what makes a second
-  /// concurrent `startDownload` a no-op instead of a second subprocess.
-  final Set<String> _downloadsStarting = {};
+  /// Which launch attempt is currently awaiting its download handle, per
+  /// entry. Present while a `startDownload` is between `controller.starting()`
+  /// and `controller.attach()` — the window where the controller has no
+  /// downloading state yet and a second caller must join instead of relaunch.
+  ///
+  /// The value is the attempt token: cancellation bumps the token so the
+  /// pending launch sees itself as stale when its handle finally lands.
+  final Map<String, int> _launchesInFlight = {};
+
+  /// Monotonic per-entry launch token. A launch records the token it started
+  /// with; `cancelDownload` bumps it to invalidate the in-flight launch. A
+  /// handle that returns after its token was bumped belongs to an attempt
+  /// nobody wants and is dropped without attach or adoption.
+  final Map<String, int> _launchTokens = {};
 
   final List<MediaEntry> _customEntries = [];
   String? _downloadDirectory;
@@ -388,7 +398,29 @@ final class DiscoveryViewModel extends ChangeNotifier {
     if (_disposed) return;
 
     if (localEntry == null) {
-      _setMediaAvailability(entryId, DiscoveryMediaAvailability.remote);
+      // Definitive answer: this entry's media is not on this machine. Any
+      // local identity from an earlier, now-refuted answer must go with it —
+      // a stale path would let Start Learning open a file Core no longer
+      // knows about, and a projected "completed" snapshot would keep saying
+      // "on this device" after the media is gone.
+      _localPaths.remove(entryId);
+      _mediaIds.remove(entryId);
+      final snapshots = Map<String, DownloadStatusSnapshot>.of(
+        _state.downloadSnapshots,
+      );
+      // Only the stale completed projection is dropped. A live downloading or
+      // failed snapshot is the acquisition lifecycle's own fact and survives.
+      if (snapshots[entryId]?.kind == DownloadStatusKind.completed) {
+        snapshots.remove(entryId);
+      }
+      _state = _state.copyWith(
+        downloadSnapshots: snapshots,
+        mediaAvailability: {
+          ..._state.mediaAvailability,
+          entryId: DiscoveryMediaAvailability.remote,
+        },
+      );
+      notifyListeners();
       return;
     }
 
@@ -511,22 +543,32 @@ final class DiscoveryViewModel extends ChangeNotifier {
   /// with nothing to acquire never starts one.
   Future<void> startDownload(String entryId) async {
     if (_state.downloadStateOf(entryId) == DownloadState.done) return;
-    // Single-flight: a second caller while the first is still between "asked"
-    // and "attached" joins it instead of spawning another subprocess.
-    if (!_downloadsStarting.add(entryId)) return;
+    // Established single-flight: once a handle is attached the controller is
+    // in `downloading`, and restarting it would cancel the live handle and
+    // relaunch. A joiner (e.g. `acquireForLearning`) waits on the acquisition
+    // completer instead, which the original handle's adoption resolves.
+    if (_state.downloadStateOf(entryId) == DownloadState.downloading) return;
+    // Launch-window single-flight: another attempt is still between
+    // `controller.starting()` and `controller.attach()`. A launch whose token
+    // was invalidated by a cancel is not in flight anymore and may be
+    // superseded by a fresh attempt.
+    final inFlight = _launchesInFlight[entryId];
+    if (inFlight != null && inFlight == _launchTokens[entryId]) return;
 
     final entry = _state.entryById(entryId);
     final mediaUrl = entry?.mediaUrl;
     if (entry == null ||
         mediaUrl == null ||
         entry.acquisition == MediaAcquisition.none) {
-      _downloadsStarting.remove(entryId);
       _completeAcquisition(entryId, null);
       return;
     }
 
     final controller = _downloadControllerFor(entryId);
     controller.starting();
+    final token = (_launchTokens[entryId] ?? 0) + 1;
+    _launchTokens[entryId] = token;
+    _launchesInFlight[entryId] = token;
 
     try {
       if (_downloadDirectory == null) {
@@ -563,6 +605,13 @@ final class DiscoveryViewModel extends ChangeNotifier {
         _completeAcquisition(entryId, null);
         return;
       }
+      // A cancel during the launch window invalidated this attempt: the
+      // handle belongs to nobody and must be dropped without attach, without
+      // adoption, and without disturbing the cancelled state.
+      if (!_isCurrentLaunch(entryId, token)) {
+        handle.cancel();
+        return;
+      }
 
       controller.attach(
         progress: handle.progress,
@@ -573,11 +622,23 @@ final class DiscoveryViewModel extends ChangeNotifier {
     } catch (error) {
       debugPrint('Error starting download: $error');
       if (_disposed) return;
-      controller.fail(_importRepository.failureDetail(error));
+      // Only a current attempt may surface its launch failure. A stale launch
+      // that errors after a cancel must not flip the cancelled/none state to
+      // failed.
+      if (_isCurrentLaunch(entryId, token)) {
+        controller.fail(_importRepository.failureDetail(error));
+      }
     } finally {
-      _downloadsStarting.remove(entryId);
+      // Remove this attempt's own marker only: a newer attempt that started
+      // while this one was still finishing keeps its bookkeeping.
+      if (_launchesInFlight[entryId] == token) {
+        _launchesInFlight.remove(entryId);
+      }
     }
   }
+
+  bool _isCurrentLaunch(String entryId, int token) =>
+      !_disposed && _launchTokens[entryId] == token;
 
   /// The "start learning" intent, as a future that resolves to a local path.
   ///
@@ -613,23 +674,29 @@ final class DiscoveryViewModel extends ChangeNotifier {
       ),
     );
 
-    await startDownload(entryId);
-    if (_disposed) return null;
+    // Launch in the background. The returned future resolves the moment the
+    // acquisition lifecycle resolves — adoption with the path, failure or
+    // cancel with null — so a cancel during the launch window is answered
+    // promptly instead of waiting for the stale launch to settle.
+    unawaited(() async {
+      try {
+        await startDownload(entryId);
+      } catch (_) {
+        // The launch reports its own failures through the download state.
+      }
+      // Safety net: a launch that decided there is nothing to acquire (no
+      // URL, acquisition none, directory pick cancelled) resolves the intent
+      // empty rather than hanging the caller. An active download resolves
+      // the bridge itself.
+      final state = _state.downloadStateOf(entryId);
+      if (!completer.isCompleted &&
+          !_launchesInFlight.containsKey(entryId) &&
+          state != DownloadState.downloading &&
+          state != DownloadState.done) {
+        completer.complete(null);
+      }
+    }());
 
-    // `startDownload` may have decided there is nothing to acquire (no URL,
-    // acquisition none, directory pick cancelled), or the bytes may already
-    // be on disk with Core adoption still in flight. Either way the bridge
-    // must not hang: an active download resolves it on completion (adoption
-    // resolves with the path, failure/cancel with null), and anything else
-    // resolves empty right here.
-    final starting = _downloadsStarting.contains(entryId);
-    final state = _state.downloadStateOf(entryId);
-    if (!completer.isCompleted &&
-        !starting &&
-        state != DownloadState.downloading &&
-        state != DownloadState.done) {
-      completer.complete(null);
-    }
     return completer.future;
   }
 
@@ -683,6 +750,13 @@ final class DiscoveryViewModel extends ChangeNotifier {
 
   void cancelDownload(String entryId) {
     _downloadControllers[entryId]?.cancel();
+    // Invalidate an in-flight launch: a handle that lands later belongs to
+    // an attempt nobody wants, so the pending `startDownload` will see a
+    // stale token and drop it. (No launch in flight → nothing to invalidate;
+    // an attached download is already handled by the controller's own cancel.)
+    if (_launchesInFlight.containsKey(entryId)) {
+      _launchTokens[entryId] = (_launchTokens[entryId] ?? 0) + 1;
+    }
     // A cancelled run ends the intent empty: no adoption, no Workbench.
     _completeAcquisition(entryId, null);
   }
